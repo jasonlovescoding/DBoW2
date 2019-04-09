@@ -39,7 +39,7 @@ void testDatabase(const vector<vector<cv::Mat > > &features);
 // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - 
 
 // number of training images
-const int NIMAGES = 4;
+const int NIMAGES = 3;
 
 // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - 
 
