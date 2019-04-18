@@ -11,7 +11,7 @@
 #include <memory> 
 
 // DBoW2
-#include "DBoW2.h" // defines OrbVocabulary and OrbDatabase
+#include "DBoW2.h"
 
 // libtorch
 #include <torch/script.h>
@@ -28,12 +28,12 @@ using namespace std;
 
 // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - 
 
-torch::Tensor nms_fast(torch::Tensor in_corners, int height, int width, vector<vector<cv::Mat > > &features, int dist_thresh);
-void run(std::shared_ptr<torch::jit::script::Module> module, torch::Tensor input, vector<vector<cv::Mat > > &features);
-void loadFeatures(vector<vector<cv::Mat > > &features, int height=120, int width=160);
-void changeStructure(const cv::Mat &plain, vector<cv::Mat> &out);
-void testVocCreation(const vector<vector<cv::Mat > > &features);
-void testDatabase(const vector<vector<cv::Mat > > &features);
+torch::Tensor nms_fast(torch::Tensor in_corners, int height, int width, int dist_thresh);
+cv::Mat run(std::shared_ptr<torch::jit::script::Module> module, torch::Tensor input);
+void loadFeatures(vector<vector<vector<float> > > &features, int height=120, int width=160);
+void changeStructure(const cv::Mat &plain, vector<vector<vector<float> > > &out);
+void testVocCreation(const vector<vector<vector<float> > > &features);
+void testDatabase(const vector<vector<vector<float> > > &features);
 
 
 // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - 
@@ -53,7 +53,7 @@ void wait()
 
 int main()
 {
-  vector<vector<cv::Mat > > features;
+  vector<vector<vector<float> > > features;
   loadFeatures(features);
 
   testVocCreation(features);
@@ -67,7 +67,7 @@ int main()
 
 // ----------------------------------------------------------------------------
 
-torch::Tensor nms_fast(torch::Tensor in_corners, int height, int width, vector<vector<cv::Mat > > &features, int dist_thresh)
+torch::Tensor nms_fast(torch::Tensor in_corners, int height, int width, int dist_thresh)
 {
   torch::Tensor grid = torch::zeros({height, width}).to(torch::kInt64);  
   torch::Tensor inds = torch::zeros({height, width}).to(torch::kInt64);  
@@ -133,7 +133,7 @@ torch::Tensor nms_fast(torch::Tensor in_corners, int height, int width, vector<v
 
 // ----------------------------------------------------------------------------
 
-void run(std::shared_ptr<torch::jit::script::Module> module, torch::Tensor input, vector<vector<cv::Mat > > &features)
+cv::Mat run(std::shared_ptr<torch::jit::script::Module> module, torch::Tensor input)
 {
   int cell = 8;
   float conf_thresh = 0.015; 
@@ -166,7 +166,7 @@ void run(std::shared_ptr<torch::jit::script::Module> module, torch::Tensor input
   torch::Tensor ind = (heatmap > conf_thresh).nonzero();
   if (ind.size(0) == 0)
   {
-    return;
+    return cv::Mat::zeros(0, 0, CV_32F);
   }
   torch::Tensor pts = torch::zeros({3, ind.size(0)}); 
   auto xs = ind.index_select(1, torch::zeros(1).to(torch::kLong)).squeeze();
@@ -177,7 +177,7 @@ void run(std::shared_ptr<torch::jit::script::Module> module, torch::Tensor input
     pts[1][i] = xs[i];
     pts[2][i] = heatmap[xs[i]][ys[i]];
   }
-  pts = nms_fast(pts, H, W, features, nms_dist); 
+  pts = nms_fast(pts, H, W, nms_dist); 
   torch::Tensor inds = torch::argsort(pts.index_select(0, torch::full({1}, 2).to(torch::kLong)), -1, true).squeeze();
   pts = pts.index_select(1, inds);
   // neglect border removing (a TODO, maybe?)
@@ -199,12 +199,13 @@ void run(std::shared_ptr<torch::jit::script::Module> module, torch::Tensor input
     desc = desc.reshape({D, -1});
     desc /= torch::frobenius_norm(desc, {0});
   }
-  cout << torch::sum(desc) << endl;
+  desc = desc.transpose(0, 1);
+  return cv::Mat(desc.sizes()[0], desc.sizes()[1], CV_32F, desc.data<float>());
 }
 
 // ----------------------------------------------------------------------------
 
-void loadFeatures(vector<vector<cv::Mat > > &features, int height, int width)
+void loadFeatures(vector<vector<vector<float> > > &features, int height, int width)
 {
   features.clear();
   features.reserve(NIMAGES);
@@ -224,33 +225,36 @@ void loadFeatures(vector<vector<cv::Mat > > &features, int height, int width)
 
     // Create a vector of inputs.
     cout << "Extracting superpoint features..." << endl;
-    run(module, input, features);
+    cv::Mat descriptors = run(module, input);
+
+    changeStructure(descriptors, features);
   }
 }
 
 // ----------------------------------------------------------------------------
 
-void changeStructure(const cv::Mat &plain, vector<cv::Mat> &out)
+void changeStructure(const cv::Mat &plain, vector<vector<vector<float> > > &out)
 {
   out.resize(plain.rows);
 
   for(int i = 0; i < plain.rows; ++i)
   {
-    out[i] = plain.row(i);
+    out[i].resize(1);
+    out[i][0].insert(out[i][0].end(), plain.ptr<float>(i), plain.ptr<float>(i) + plain.cols);
   }
 }
 
 // ----------------------------------------------------------------------------
 
-void testVocCreation(const vector<vector<cv::Mat > > &features)
+void testVocCreation(const vector<vector<vector<float> > > &features)
 {
   // branching factor and depth levels 
   const int k = 9;
   const int L = 3;
   const WeightingType weight = TF_IDF;
-  const ScoringType score = L1_NORM;
+  const ScoringType score = L2_NORM;
 
-  OrbVocabulary voc(k, L, weight, score);
+  SPPVocabulary voc(k, L, weight, score);
 
   cout << "Creating a small " << k << "^" << L << " vocabulary..." << endl;
   voc.create(features);
@@ -282,14 +286,14 @@ void testVocCreation(const vector<vector<cv::Mat > > &features)
 
 // ----------------------------------------------------------------------------
 
-void testDatabase(const vector<vector<cv::Mat > > &features)
+void testDatabase(const vector<vector<vector<float> > > &features)
 {
   cout << "Creating a small database..." << endl;
 
   // load the vocabulary from disk
-  OrbVocabulary voc("small_voc.yml.gz");
+  SPPVocabulary voc("small_voc.yml.gz");
   
-  OrbDatabase db(voc, false, 0); // false = do not use direct index
+  SPPDatabase db(voc, false, 0); // false = do not use direct index
   // (so ignore the last param)
   // The direct index is useful if we want to retrieve the features that 
   // belong to some vocabulary node.
@@ -329,7 +333,7 @@ void testDatabase(const vector<vector<cv::Mat > > &features)
   
   // once saved, we can load it again  
   cout << "Retrieving database once again..." << endl;
-  OrbDatabase db2("small_db.yml.gz");
+  SPPDatabase db2("small_db.yml.gz");
   cout << "... done! This is: " << endl << db2 << endl;
 }
 
